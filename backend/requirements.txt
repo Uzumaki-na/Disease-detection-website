@@ -1,3 +1,4 @@
+# Core Dependencies
 fastapi==0.109.2
 uvicorn==0.27.1
 scikit-learn==1.4.0
@@ -12,12 +13,25 @@ passlib[bcrypt]==1.7.4
 motor==3.1.1
 pymongo==4.3.3
 python-dotenv==1.0.1
-torch==2.2.1
-torchvision==0.17.1
+
+# PyTorch with CUDA Support
+# These packages will be installed from PyTorch's CUDA 12.1 repository
+# If you have a different CUDA version, replace cu121 with your version (e.g., cu118 for CUDA 11.8)
+--find-links https://download.pytorch.org/whl/cu121
+torch>=2.5.1+cu121
+torchvision>=0.20.1+cu121
+torchaudio>=2.5.1+cu121
+
+# Image Processing
 pillow==10.2.0
+
+# API and Authentication
 requests==2.31.0
 bcrypt==4.1.2
 kaggle==1.5.16
 python-jose[cryptography]==3.3.0
 fastapi-cors==0.0.6
 tqdm==4.66.1
+
+# Note: To install PyTorch with GPU support, run:
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

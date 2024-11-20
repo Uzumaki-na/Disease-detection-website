@@ -53,11 +53,22 @@ def setup_device():
     """
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
-        torch.backends.cudnn.benchmark = True  # Optimize performance
-        logger.info("Using GPU: " + torch.cuda.get_device_name(0))
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere
+        torch.backends.cudnn.allow_tf32 = True  # Allow TF32 on Ampere
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA Version: {torch.version.cuda}")
+        logger.info(f"PyTorch CUDA: {torch.__version__}")
+        # Log GPU memory
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"GPU Memory: {gpu_memory:.1f}GB")
     else:
         device = torch.device("cpu")
-        logger.info("Using CPU")
+        logger.info("Using CPU - No GPU detected!")
+        logger.info("Please ensure NVIDIA drivers and CUDA toolkit are installed")
+        logger.info(f"PyTorch version: {torch.__version__}")
+        if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+            logger.info("CUDA is not available in this PyTorch installation")
     return device
 
 def is_valid_image(image_path):
@@ -113,17 +124,23 @@ def safe_loader(path):
 class SafeImageFolder(datasets.ImageFolder):
     def __init__(self, root, transform=None):
         super().__init__(root, transform=transform, loader=safe_loader)
+        self.error_count = 0  # Track consecutive errors
         
     def __getitem__(self, index):
         try:
+            self.error_count = 0  # Reset error count on success
             return super().__getitem__(index)
         except Exception as e:
             logger.error(f"Error getting item at index {index}: {str(e)}")
-            # Skip problematic images
-            if index > 0:
-                return self.__getitem__(index - 1)
-            else:
-                return self.__getitem__(index + 1)
+            self.error_count += 1
+            if self.error_count > 5:  # Prevent infinite loops
+                logger.error("Too many consecutive errors, returning default image")
+                img = Image.new('RGB', (224, 224), 'black')
+                if self.transform:
+                    img = self.transform(img)
+                return img, 0  # Return with class 0
+            # Try next index
+            return self.__getitem__((index + 1) % len(self))
 
 def create_data_loaders(data_dir, batch_size=32, num_workers=4, fold_idx=None, k_folds=5):
     """
@@ -231,14 +248,26 @@ def create_data_loaders(data_dir, batch_size=32, num_workers=4, fold_idx=None, k
 class EfficientModel(nn.Module):
     def __init__(self, num_classes):
         super(EfficientModel, self).__init__()
-        # Load pre-trained EfficientNet
-        self.model = models.efficientnet_b0(pretrained=True)
+        # Load pre-trained EfficientNet using new weights parameter
+        self.model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        
+        # Freeze most layers for transfer learning
+        for param in self.model.features.parameters():
+            param.requires_grad = False
+            
+        # Only train the last few layers
+        for param in self.model.features[-2:].parameters():
+            param.requires_grad = True
+            
         # Replace classifier
         self.model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),  # Increased dropout
+            nn.Linear(1280, 640),  # Added intermediate layer
+            nn.ReLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(1280, num_classes)
+            nn.Linear(640, num_classes)
         )
-    
+
     def forward(self, x):
         return self.model(x)
 
@@ -248,13 +277,19 @@ def train_model(model, train_loader, val_loader, device, num_epochs=10):
     """
     try:
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)  # Added weight decay
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1)
+        # Separate parameter groups with different learning rates
+        optimizer = optim.AdamW([
+            {'params': model.model.features.parameters(), 'lr': 1e-5},  # Very small LR for frozen layers
+            {'params': model.model.classifier.parameters(), 'lr': 1e-3}  # Larger LR for new layers
+        ], weight_decay=0.01)
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1, min_lr=1e-6)
         
         model = model.to(device)
+        scaler = torch.cuda.amp.GradScaler()  # Added automatic mixed precision
         best_val_loss = float('inf')
         best_val_acc = 0.0
-        patience = 7  # Early stopping patience
+        patience = 10  # Increased patience
         patience_counter = 0
         
         # Training history
@@ -275,14 +310,17 @@ def train_model(model, train_loader, val_loader, device, num_epochs=10):
                     inputs, labels = inputs.to(device), labels.to(device)
                     
                     optimizer.zero_grad()
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
-                    loss.backward()
+                    with torch.cuda.amp.autocast():
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                    
+                    scaler.scale(loss).backward()
                     
                     # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     
                     train_loss += loss.item()
                     batch_count += 1
@@ -407,13 +445,24 @@ def train_model(model, train_loader, val_loader, device, num_epochs=10):
 
 def download_and_extract_dataset(dataset_name):
     """
-    Download and extract dataset from Kaggle.
+    Download and extract dataset from Kaggle with proper train/val split.
     """
     logger.info(f"Downloading {dataset_name} dataset...")
     base_dir = Path("datasets") / dataset_name
     base_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # Check available disk space (in bytes)
+        import shutil
+        total, used, free = shutil.disk_usage("/")
+        required_space = {
+            "malaria": 500 * 1024 * 1024,  # 500MB
+            "skin_cancer": 3 * 1024 * 1024 * 1024  # 3GB
+        }
+
+        if free < required_space.get(dataset_name, 5 * 1024 * 1024 * 1024):
+            raise OSError(f"Not enough disk space. Need at least {required_space.get(dataset_name) / (1024*1024*1024):.1f}GB free")
+
         if dataset_name == "malaria":
             # Download malaria dataset
             kaggle.api.dataset_download_files(
@@ -425,58 +474,114 @@ def download_and_extract_dataset(dataset_name):
             # Organize malaria dataset
             cell_images = base_dir / "cell_images"
             if cell_images.exists():
-                # Create train directories
+                # Create train and validation directories
+                for split in ["train", "val"]:
+                    for category in ["Parasitized", "Uninfected"]:
+                        split_dir = base_dir / split / category
+                        split_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Process each category
                 for category in ["Parasitized", "Uninfected"]:
-                    train_dir = base_dir / "train" / category
-                    train_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Move images to train directory
                     src_dir = cell_images / category
                     if src_dir.exists():
-                        for img in src_dir.glob("*.png"):
-                            shutil.move(str(img), str(train_dir / img.name))
+                        # Get all valid images
+                        valid_images = [img for img in src_dir.glob("*.png") if is_valid_image(str(img))]
+                        
+                        # Shuffle images
+                        import random
+                        random.shuffle(valid_images)
+                        
+                        # Split into train (80%) and validation (20%)
+                        split_idx = int(len(valid_images) * 0.8)
+                        train_images = valid_images[:split_idx]
+                        val_images = valid_images[split_idx:]
+                        
+                        # Copy train images
+                        for img in train_images:
+                            try:
+                                shutil.copy2(str(img), str(base_dir / "train" / category / img.name))
+                            except Exception as e:
+                                logger.warning(f"Failed to copy train image {img}: {e}")
+                                
+                        # Copy validation images
+                        for img in val_images:
+                            try:
+                                shutil.copy2(str(img), str(base_dir / "val" / category / img.name))
+                            except Exception as e:
+                                logger.warning(f"Failed to copy validation image {img}: {e}")
                 
-                # Clean up
-                shutil.rmtree(str(cell_images))
+                # Clean up only after successful copy
+                try:
+                    shutil.rmtree(str(cell_images))
+                except Exception as e:
+                    logger.warning(f"Failed to clean up {cell_images}: {e}")
             
         elif dataset_name == "skin_cancer":
-            # Download skin cancer dataset
-            kaggle.api.dataset_download_files(
-                'kmader/skin-cancer-mnist-ham10000',
-                path=str(base_dir),
-                unzip=True
-            )
+            # Create temporary download directory
+            temp_dir = base_dir / "temp"
+            temp_dir.mkdir(exist_ok=True)
             
-            # Organize skin cancer dataset
-            ham_images = base_dir / "HAM10000_images_part_1"
-            metadata = base_dir / "HAM10000_metadata.csv"
-            
-            if ham_images.exists() and metadata.exists():
-                import pandas as pd
-                df = pd.read_csv(metadata)
+            try:
+                # Download skin cancer dataset to temp directory
+                kaggle.api.dataset_download_files(
+                    'kmader/skin-cancer-mnist-ham10000',
+                    path=str(temp_dir),
+                    unzip=True
+                )
                 
-                # Create directories for each class
-                classes = df['dx'].unique()
-                for cls in classes:
-                    (base_dir / "train" / cls).mkdir(parents=True, exist_ok=True)
+                # Process files in smaller batches
+                ham_images = temp_dir / "HAM10000_images_part_1"
+                metadata = temp_dir / "HAM10000_metadata.csv"
                 
-                # Move images to their respective class directories
-                for _, row in df.iterrows():
-                    img_id = row['image_id']
-                    dx = row['dx']
-                    src_path = ham_images / f"{img_id}.jpg"
-                    if src_path.exists():
-                        dst_path = base_dir / "train" / dx / f"{img_id}.jpg"
-                        shutil.move(str(src_path), str(dst_path))
+                if ham_images.exists() and metadata.exists():
+                    import pandas as pd
+                    df = pd.read_csv(metadata)
+                    
+                    # Create directories for each class
+                    classes = df['dx'].unique()
+                    for cls in classes:
+                        (base_dir / "train" / cls).mkdir(parents=True, exist_ok=True)
+                        (base_dir / "val" / cls).mkdir(parents=True, exist_ok=True)
+                    
+                    # Process images in batches
+                    batch_size = 100
+                    for i in range(0, len(df), batch_size):
+                        batch_df = df.iloc[i:i+batch_size]
+                        
+                        for _, row in batch_df.iterrows():
+                            img_id = row['image_id']
+                            dx = row['dx']
+                            src_path = ham_images / f"{img_id}.jpg"
+                            if src_path.exists():
+                                try:
+                                    if is_valid_image(str(src_path)):
+                                        if random.random() < 0.8:
+                                            dst_path = base_dir / "train" / dx / f"{img_id}.jpg"
+                                        else:
+                                            dst_path = base_dir / "val" / dx / f"{img_id}.jpg"
+                                        shutil.copy2(str(src_path), str(dst_path))
+                                except Exception as e:
+                                    logger.warning(f"Failed to process {img_id}: {e}")
                 
-                # Clean up
-                if ham_images.exists():
-                    shutil.rmtree(str(ham_images))
-                for file in base_dir.glob("*.csv"):
-                    file.unlink()
+                # Clean up temp directory
+                try:
+                    shutil.rmtree(str(temp_dir))
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp directory: {e}")
+
+            except Exception as e:
+                logger.error(f"Error downloading/extracting skin cancer dataset: {e}")
+                # Clean up temp directory on failure
+                if temp_dir.exists():
+                    try:
+                        shutil.rmtree(str(temp_dir))
+                    except:
+                        pass
+                raise
 
         logger.info(f"Successfully downloaded and organized {dataset_name} dataset")
         return True
+        
     except Exception as e:
         logger.error(f"Error processing {dataset_name} dataset: {str(e)}")
         return False
@@ -489,9 +594,10 @@ def check_and_download_datasets():
     for dataset in datasets:
         base_dir = Path("datasets") / dataset
         train_dir = base_dir / "train"
+        val_dir = base_dir / "val"
         
         # Download if dataset doesn't exist or is empty
-        if not train_dir.exists() or not any(train_dir.iterdir()):
+        if not train_dir.exists() or not any(train_dir.iterdir()) or not val_dir.exists() or not any(val_dir.iterdir()):
             logger.info(f"{dataset} dataset not found or empty. Downloading...")
             if not download_and_extract_dataset(dataset):
                 logger.error(f"Failed to download {dataset} dataset")

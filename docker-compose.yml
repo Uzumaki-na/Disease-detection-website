@@ -9,9 +9,20 @@ services:
       - JWT_SECRET=${JWT_SECRET:-your-secret-key-here}
       - JWT_ALGORITHM=HS256
       - MODEL_SAVE_PATH=/app/models
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME}
+      - KAGGLE_KEY=${KAGGLE_KEY}
+      - CUDA_VISIBLE_DEVICES=0
     volumes:
       - ./backend:/app
       - model_data:/app/models
+      - dataset_data:/app/datasets
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       - mongodb
@@ -40,3 +51,4 @@ services:
 volumes:
   mongodb_data:
   model_data:
+  dataset_data:
