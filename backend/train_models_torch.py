@@ -405,25 +405,104 @@ def train_model(model, train_loader, val_loader, device, num_epochs=10):
         logger.error(f"Error during training: {str(e)}")
         raise
 
-def download_dataset(dataset_name):
+def download_and_extract_dataset(dataset_name):
     """
-    Download dataset from Kaggle.
+    Download and extract dataset from Kaggle.
     """
     logger.info(f"Downloading {dataset_name} dataset...")
+    base_dir = Path("datasets") / dataset_name
+    base_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         if dataset_name == "malaria":
-            kaggle.api.dataset_download_files('iarunava/cell-images-for-detecting-malaria',
-                                            path=f"datasets/{dataset_name}",
-                                            unzip=True)
+            # Download malaria dataset
+            kaggle.api.dataset_download_files(
+                'iarunava/cell-images-for-detecting-malaria',
+                path=str(base_dir),
+                unzip=True
+            )
+            
+            # Organize malaria dataset
+            cell_images = base_dir / "cell_images"
+            if cell_images.exists():
+                # Create train directories
+                for category in ["Parasitized", "Uninfected"]:
+                    train_dir = base_dir / "train" / category
+                    train_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Move images to train directory
+                    src_dir = cell_images / category
+                    if src_dir.exists():
+                        for img in src_dir.glob("*.png"):
+                            shutil.move(str(img), str(train_dir / img.name))
+                
+                # Clean up
+                shutil.rmtree(str(cell_images))
+            
         elif dataset_name == "skin_cancer":
-            kaggle.api.dataset_download_files('kmader/skin-cancer-mnist-ham10000',
-                                            path=f"datasets/{dataset_name}",
-                                            unzip=False)
-        logger.info(f"Successfully downloaded {dataset_name} dataset")
+            # Download skin cancer dataset
+            kaggle.api.dataset_download_files(
+                'kmader/skin-cancer-mnist-ham10000',
+                path=str(base_dir),
+                unzip=True
+            )
+            
+            # Organize skin cancer dataset
+            ham_images = base_dir / "HAM10000_images_part_1"
+            metadata = base_dir / "HAM10000_metadata.csv"
+            
+            if ham_images.exists() and metadata.exists():
+                import pandas as pd
+                df = pd.read_csv(metadata)
+                
+                # Create directories for each class
+                classes = df['dx'].unique()
+                for cls in classes:
+                    (base_dir / "train" / cls).mkdir(parents=True, exist_ok=True)
+                
+                # Move images to their respective class directories
+                for _, row in df.iterrows():
+                    img_id = row['image_id']
+                    dx = row['dx']
+                    src_path = ham_images / f"{img_id}.jpg"
+                    if src_path.exists():
+                        dst_path = base_dir / "train" / dx / f"{img_id}.jpg"
+                        shutil.move(str(src_path), str(dst_path))
+                
+                # Clean up
+                if ham_images.exists():
+                    shutil.rmtree(str(ham_images))
+                for file in base_dir.glob("*.csv"):
+                    file.unlink()
+
+        logger.info(f"Successfully downloaded and organized {dataset_name} dataset")
         return True
     except Exception as e:
-        logger.error(f"Error downloading {dataset_name} dataset: {str(e)}")
+        logger.error(f"Error processing {dataset_name} dataset: {str(e)}")
         return False
+
+def check_and_download_datasets():
+    """
+    Check if datasets exist and download if needed.
+    """
+    datasets = ["malaria", "skin_cancer"]
+    for dataset in datasets:
+        base_dir = Path("datasets") / dataset
+        train_dir = base_dir / "train"
+        
+        # Download if dataset doesn't exist or is empty
+        if not train_dir.exists() or not any(train_dir.iterdir()):
+            logger.info(f"{dataset} dataset not found or empty. Downloading...")
+            if not download_and_extract_dataset(dataset):
+                logger.error(f"Failed to download {dataset} dataset")
+                continue
+            
+            # Verify dataset structure
+            if not organize_dataset(dataset):
+                logger.error(f"Failed to organize {dataset} dataset")
+                continue
+        else:
+            logger.info(f"{dataset} dataset already exists")
 
 def train_models():
     """
@@ -432,13 +511,10 @@ def train_models():
     device = setup_device()
     diagnose_gpu()
     
-    k_folds = 5
+    # Check and download datasets if needed
+    check_and_download_datasets()
     
-    # Download datasets if they don't exist
-    if not os.path.exists("datasets/skin_cancer"):
-        download_dataset("skin_cancer")
-    if not os.path.exists("datasets/malaria") or not os.listdir("datasets/malaria"):
-        download_dataset("malaria")
+    k_folds = 5
     
     # Train skin cancer model
     logger.info("Training skin cancer detection model...")
