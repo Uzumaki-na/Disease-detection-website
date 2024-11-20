@@ -166,15 +166,15 @@ def create_data_loaders(data_dir, batch_size=32, num_workers=4, fold_idx=None, k
     ])
     
     try:
-        # Load dataset
-        dataset = SafeImageFolder(data_dir, transform=None)  # No transform yet
-        logger.info(f"Found {len(dataset)} images in {data_dir}")
-        
-        if len(dataset) == 0:
-            raise ValueError(f"No valid images found in {data_dir}")
-        
-        # Setup k-fold cross-validation
+        # Check if we're using k-fold cross-validation
         if fold_idx is not None:
+            # Load the entire dataset
+            dataset = SafeImageFolder(Path(data_dir) / "train", transform=None)
+            logger.info(f"Found {len(dataset)} images in {data_dir}/train")
+            
+            if len(dataset) == 0:
+                raise ValueError(f"No valid images found in {data_dir}/train")
+            
             # Generate indices for k-fold split
             indices = list(range(len(dataset)))
             np.random.shuffle(indices)
@@ -190,53 +190,46 @@ def create_data_loaders(data_dir, batch_size=32, num_workers=4, fold_idx=None, k
             val_sampler = SubsetRandomSampler(val_indices)
             
             # Create datasets with appropriate transforms
-            train_dataset = SafeImageFolder(data_dir, transform=train_transform)
-            val_dataset = SafeImageFolder(data_dir, transform=val_transform)
+            train_dataset = SafeImageFolder(Path(data_dir) / "train", transform=train_transform)
+            val_dataset = SafeImageFolder(Path(data_dir) / "train", transform=val_transform)  # Use same directory for validation
             
             # Create data loaders
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
                 sampler=train_sampler,
-                num_workers=2,
-                pin_memory=True,
-                persistent_workers=True
+                num_workers=num_workers,
+                pin_memory=True
             )
             
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 sampler=val_sampler,
-                num_workers=2,
-                pin_memory=True,
-                persistent_workers=True
+                num_workers=num_workers,
+                pin_memory=True
             )
         else:
-            # Regular train/val split
-            val_size = int(0.2 * len(dataset))
-            train_size = len(dataset) - val_size
-            train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+            # Regular train/val split using separate directories
+            train_dataset = SafeImageFolder(Path(data_dir) / "train", transform=train_transform)
+            val_dataset = SafeImageFolder(Path(data_dir) / "val", transform=val_transform)
             
-            # Apply transforms
-            train_dataset.dataset.transform = train_transform
-            val_dataset.dataset.transform = val_transform
+            logger.info(f"Found {len(train_dataset)} training images and {len(val_dataset)} validation images")
             
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=2,
-                pin_memory=True,
-                persistent_workers=True
+                num_workers=num_workers,
+                pin_memory=True
             )
             
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=2,
-                pin_memory=True,
-                persistent_workers=True
+                num_workers=num_workers,
+                pin_memory=True
             )
         
         return train_loader, val_loader
@@ -614,61 +607,88 @@ def train_models():
     """
     Main function to train models with k-fold cross-validation.
     """
-    device = setup_device()
-    diagnose_gpu()
-    
-    # Check and download datasets if needed
-    check_and_download_datasets()
-    
-    k_folds = 5
-    
-    # Train skin cancer model
-    logger.info("Training skin cancer detection model...")
-    skin_data_dir = "datasets/skin_cancer"
-    if os.path.exists(skin_data_dir):
-        # K-fold cross-validation
-        fold_histories = []
-        for fold in range(k_folds):
-            logger.info(f"Training fold {fold+1}/{k_folds}")
-            train_loader, val_loader = create_data_loaders(skin_data_dir, fold_idx=fold, k_folds=k_folds)
-            model = EfficientModel(num_classes=7)
-            _, history = train_model(model, train_loader, val_loader, device)
-            fold_histories.append(history)
+    try:
+        # Check and download datasets if needed
+        check_and_download_datasets()
         
-        # Calculate and log average metrics across folds
-        avg_metrics = {
-            'val_acc': np.mean([h['val_acc'][-1] for h in fold_histories]),
-            'val_precision': np.mean([h['val_precision'][-1] for h in fold_histories]),
-            'val_recall': np.mean([h['val_recall'][-1] for h in fold_histories]),
-            'val_f1': np.mean([h['val_f1'][-1] for h in fold_histories])
-        }
-        logger.info("Average metrics across folds:")
-        for metric, value in avg_metrics.items():
-            logger.info(f"{metric}: {value:.4f}")
-    
-    # Train malaria model
-    logger.info("Training malaria detection model...")
-    malaria_data_dir = "datasets/malaria"
-    if os.path.exists(malaria_data_dir):
-        # K-fold cross-validation
-        fold_histories = []
-        for fold in range(k_folds):
-            logger.info(f"Training fold {fold+1}/{k_folds}")
-            train_loader, val_loader = create_data_loaders(malaria_data_dir, fold_idx=fold, k_folds=k_folds)
-            model = EfficientModel(num_classes=2)
-            _, history = train_model(model, train_loader, val_loader, device)
-            fold_histories.append(history)
+        # Train skin cancer detection model
+        logger.info("Training skin cancer detection model...")
+        skin_data_dir = Path("datasets/skin_cancer")
         
-        # Calculate and log average metrics across folds
-        avg_metrics = {
-            'val_acc': np.mean([h['val_acc'][-1] for h in fold_histories]),
-            'val_precision': np.mean([h['val_precision'][-1] for h in fold_histories]),
-            'val_recall': np.mean([h['val_recall'][-1] for h in fold_histories]),
-            'val_f1': np.mean([h['val_f1'][-1] for h in fold_histories])
-        }
-        logger.info("Average metrics across folds:")
-        for metric, value in avg_metrics.items():
-            logger.info(f"{metric}: {value:.4f}")
+        if not (skin_data_dir / "train").exists() or not any((skin_data_dir / "train").iterdir()):
+            logger.error("Skin cancer dataset not found or empty. Skipping training.")
+            return
+            
+        # Use k-fold cross-validation
+        k_folds = 5
+        device = setup_device()
+        
+        for fold in range(k_folds):
+            logger.info(f"Training fold {fold + 1}/{k_folds}")
+            
+            # Create model
+            model = EfficientModel(num_classes=7).to(device)
+            
+            try:
+                # Create data loaders for this fold
+                train_loader, val_loader = create_data_loaders(skin_data_dir, fold_idx=fold, k_folds=k_folds)
+                
+                # Train the model
+                model, history = train_model(
+                    model=model,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    device=device,
+                    num_epochs=50  # Adjust as needed
+                )
+                
+                # Save fold-specific model
+                torch.save({
+                    'fold': fold,
+                    'model_state_dict': model.state_dict(),
+                    'history': history
+                }, f'skin_cancer_model_fold_{fold}.pth')
+                
+            except Exception as e:
+                logger.error(f"Error training fold {fold + 1}: {str(e)}")
+                continue
+        
+        # Train malaria detection model
+        logger.info("Training malaria detection model...")
+        malaria_data_dir = Path("datasets/malaria")
+        
+        if not (malaria_data_dir / "train").exists() or not any((malaria_data_dir / "train").iterdir()):
+            logger.error("Malaria dataset not found or empty. Skipping training.")
+            return
+            
+        # Create malaria model
+        model = EfficientModel(num_classes=2).to(device)
+        
+        try:
+            # Create data loaders
+            train_loader, val_loader = create_data_loaders(malaria_data_dir)
+            
+            # Train the model
+            model, history = train_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                num_epochs=50  # Adjust as needed
+            )
+            
+            # Save final model
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'history': history
+            }, 'malaria_model.pth')
+            
+        except Exception as e:
+            logger.error(f"Error training malaria model: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error in train_models: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     train_models()
