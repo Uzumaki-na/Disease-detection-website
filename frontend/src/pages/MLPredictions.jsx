@@ -17,12 +17,12 @@ const MLPredictions = () => {
 
         <MLPrediction 
           title="Skin Cancer Detection" 
-          endpoint="/predict_skin_cancer" 
+          endpoint="/predict/skin-cancer" 
         />
         
         <MLPrediction 
           title="Malaria Detection" 
-          endpoint="/predict_malaria" 
+          endpoint="/predict/malaria" 
         />
       </Box>
     </Container>

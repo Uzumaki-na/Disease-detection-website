@@ -1,23 +1,37 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
-from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, SubsetRandomSampler
+from torchvision import transforms, models, datasets
 import numpy as np
-import os
-import logging
-import kaggle
 from pathlib import Path
-import zipfile
+import logging
+import psutil
+import GPUtil
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, accuracy_score
+from torch.utils.tensorboard import SummaryWriter
+import os
 import shutil
 from PIL import Image
-import io
-import random
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def print_gpu_utilization():
+    """Print GPU memory usage"""
+    gpus = GPUtil.getGPUs()
+    if gpus:
+        gpu = gpus[0]  # Assuming using first GPU
+        logger.info(f'GPU Memory: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB ({gpu.memoryUtil*100:.1f}%)')
+        logger.info(f'GPU Load: {gpu.load*100:.1f}%')
+
+def print_memory_usage():
+    """Print system memory usage"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    logger.info(f'RAM Memory: {memory_info.rss / 1024/1024:.1f}MB')
+    logger.info(f'Virtual Memory: {memory_info.vms / 1024/1024:.1f}MB')
 
 def diagnose_gpu():
     """
@@ -53,23 +67,20 @@ def setup_device():
     """
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
+        # Enable cuDNN autotuner
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere
-        torch.backends.cudnn.allow_tf32 = True  # Allow TF32 on Ampere
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"CUDA Version: {torch.version.cuda}")
-        logger.info(f"PyTorch CUDA: {torch.__version__}")
-        # Log GPU memory
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        logger.info(f"GPU Memory: {gpu_memory:.1f}GB")
-    else:
-        device = torch.device("cpu")
-        logger.info("Using CPU - No GPU detected!")
-        logger.info("Please ensure NVIDIA drivers and CUDA toolkit are installed")
-        logger.info(f"PyTorch version: {torch.__version__}")
-        if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
-            logger.info("CUDA is not available in this PyTorch installation")
-    return device
+        # Enable TF32 for faster training
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Clear GPU cache
+        torch.cuda.empty_cache()
+        # Set GPU to maximum performance mode
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+        return device
+    return torch.device("cpu")
 
 def is_valid_image(image_path):
     """
@@ -128,313 +139,290 @@ class SafeImageFolder(datasets.ImageFolder):
         
     def __getitem__(self, index):
         try:
-            self.error_count = 0  # Reset error count on success
             return super().__getitem__(index)
         except Exception as e:
-            logger.error(f"Error getting item at index {index}: {str(e)}")
+            logger.warning(f"Error loading image at index {index}: {str(e)}")
             self.error_count += 1
-            if self.error_count > 5:  # Prevent infinite loops
-                logger.error("Too many consecutive errors, returning default image")
-                img = Image.new('RGB', (224, 224), 'black')
-                if self.transform:
-                    img = self.transform(img)
-                return img, 0  # Return with class 0
+            if self.error_count > 10:  # Avoid infinite loops
+                raise Exception("Too many consecutive errors loading images")
             # Try next index
             return self.__getitem__((index + 1) % len(self))
 
-def create_data_loaders(data_dir, batch_size=32, num_workers=4, fold_idx=None, k_folds=5):
-    """
-    Create PyTorch DataLoaders for training and validation with k-fold cross-validation support.
-    """
-    # Enhanced data augmentation for training
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+def create_data_loaders(data_dir, batch_size=256, num_workers=4, fold_idx=None, k_folds=5):
+    """Fast data loading with minimal augmentation for speed"""
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),  # Keep antialiasing for stability
         transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Validation transform without augmentation
     val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+
+    if fold_idx is not None:
+        dataset = datasets.ImageFolder(str(Path(data_dir) / "train"), transform=None)
+        indices = list(range(len(dataset)))
+        np.random.shuffle(indices)
+        fold_size = len(dataset) // k_folds
+        val_start = fold_idx * fold_size
+        val_end = (fold_idx + 1) * fold_size if fold_idx != k_folds - 1 else len(dataset)
+        
+        train_indices = indices[:val_start] + indices[val_end:]
+        val_indices = indices[val_start:val_end]
+        
+        train_sampler = SubsetRandomSampler(train_indices)
+        val_sampler = SubsetRandomSampler(val_indices)
+        
+        train_dataset = datasets.ImageFolder(str(Path(data_dir) / "train"), transform=transform)
+        val_dataset = datasets.ImageFolder(str(Path(data_dir) / "train"), transform=val_transform)
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
+    else:
+        train_dataset = datasets.ImageFolder(str(Path(data_dir) / "train"), transform=transform)
+        val_dataset = datasets.ImageFolder(str(Path(data_dir) / "val"), transform=val_transform)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
     
-    try:
-        # Check if we're using k-fold cross-validation
-        if fold_idx is not None:
-            # Load the entire dataset
-            dataset = SafeImageFolder(Path(data_dir) / "train", transform=None)
-            logger.info(f"Found {len(dataset)} images in {data_dir}/train")
-            
-            if len(dataset) == 0:
-                raise ValueError(f"No valid images found in {data_dir}/train")
-            
-            # Generate indices for k-fold split
-            indices = list(range(len(dataset)))
-            np.random.shuffle(indices)
-            fold_size = len(dataset) // k_folds
-            val_start = fold_idx * fold_size
-            val_end = (fold_idx + 1) * fold_size if fold_idx != k_folds - 1 else len(dataset)
-            
-            train_indices = indices[:val_start] + indices[val_end:]
-            val_indices = indices[val_start:val_end]
-            
-            # Create samplers
-            train_sampler = SubsetRandomSampler(train_indices)
-            val_sampler = SubsetRandomSampler(val_indices)
-            
-            # Create datasets with appropriate transforms
-            train_dataset = SafeImageFolder(Path(data_dir) / "train", transform=train_transform)
-            val_dataset = SafeImageFolder(Path(data_dir) / "train", transform=val_transform)  # Use same directory for validation
-            
-            # Create data loaders
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                sampler=train_sampler,
-                num_workers=num_workers,
-                pin_memory=True
-            )
-            
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                sampler=val_sampler,
-                num_workers=num_workers,
-                pin_memory=True
-            )
-        else:
-            # Regular train/val split using separate directories
-            train_dataset = SafeImageFolder(Path(data_dir) / "train", transform=train_transform)
-            val_dataset = SafeImageFolder(Path(data_dir) / "val", transform=val_transform)
-            
-            logger.info(f"Found {len(train_dataset)} training images and {len(val_dataset)} validation images")
-            
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=True
-            )
-            
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=True
-            )
-        
-        return train_loader, val_loader
-        
-    except Exception as e:
-        logger.error(f"Error creating data loaders: {str(e)}")
-        raise
+    return train_loader, val_loader
 
 class EfficientModel(nn.Module):
     def __init__(self, num_classes):
-        super(EfficientModel, self).__init__()
-        # Load pre-trained EfficientNet using new weights parameter
+        super().__init__()
         self.model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        self.model.classifier = nn.Linear(1280, num_classes)
         
-        # Freeze most layers for transfer learning
-        for param in self.model.features.parameters():
-            param.requires_grad = False
-            
-        # Only train the last few layers
-        for param in self.model.features[-2:].parameters():
-            param.requires_grad = True
-            
-        # Replace classifier
-        self.model.classifier = nn.Sequential(
-            nn.Dropout(p=0.3),  # Increased dropout
-            nn.Linear(1280, 640),  # Added intermediate layer
-            nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(640, num_classes)
-        )
-
     def forward(self, x):
         return self.model(x)
 
 def train_model(model, train_loader, val_loader, device, num_epochs=10):
-    """
-    Train the model using GPU acceleration with improved training pipeline.
-    """
-    try:
-        criterion = nn.CrossEntropyLoss()
-        # Separate parameter groups with different learning rates
-        optimizer = optim.AdamW([
-            {'params': model.model.features.parameters(), 'lr': 1e-5},  # Very small LR for frozen layers
-            {'params': model.model.classifier.parameters(), 'lr': 1e-3}  # Larger LR for new layers
-        ], weight_decay=0.01)
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    
+    # More stable learning rate
+    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.002,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        div_factor=10.0,
+        final_div_factor=50.0
+    )
+    
+    # Initialize tensorboard writer
+    writer = SummaryWriter('runs/training_metrics')
+    
+    # Enable automatic mixed precision with more stable settings
+    scaler = torch.amp.GradScaler()  # Updated to new API
+    
+    best_acc = 0.0
+    best_model = None
+    best_metrics = None
+    
+    logger.info("=== Starting Training ===")
+    
+    for epoch in range(num_epochs):
+        # Training Phase
+        model.train()
+        running_loss = 0.0
+        epoch_loss = 0.0
+        all_train_preds = []
+        all_train_labels = []
+        correct = 0
+        total = 0
         
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1, min_lr=1e-6)
-        
-        model = model.to(device)
-        scaler = torch.cuda.amp.GradScaler()  # Added automatic mixed precision
-        best_val_loss = float('inf')
-        best_val_acc = 0.0
-        patience = 10  # Increased patience
-        patience_counter = 0
-        
-        # Training history
-        history = {
-            'train_loss': [], 'val_loss': [], 
-            'val_acc': [], 'val_precision': [], 
-            'val_recall': [], 'val_f1': []
-        }
-        
-        for epoch in range(num_epochs):
-            # Training phase
-            model.train()
-            train_loss = 0.0
-            batch_count = 0
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
-            for batch_idx, (inputs, labels) in enumerate(train_loader):
-                try:
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    
-                    optimizer.zero_grad()
-                    with torch.cuda.amp.autocast():
-                        outputs = model(inputs)
-                        loss = criterion(outputs, labels)
-                    
-                    scaler.scale(loss).backward()
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    train_loss += loss.item()
-                    batch_count += 1
-                    
-                    if batch_idx % 10 == 0:
-                        logger.info(f'Epoch {epoch+1}/{num_epochs} - Batch {batch_idx}/{len(train_loader)}: Loss {loss.item():.4f}')
-                        
-                except Exception as e:
-                    logger.error(f"Error in training batch {batch_idx}: {str(e)}")
-                    continue
+            optimizer.zero_grad(set_to_none=True)
             
-            if batch_count == 0:
-                logger.error("No successful training batches in this epoch")
-                continue
-                
-            train_loss = train_loss / batch_count
-            history['train_loss'].append(train_loss)
+            # Use mixed precision training with updated API
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
             
-            # Validation phase
-            model.eval()
-            val_loss = 0.0
-            val_batch_count = 0
-            all_preds = []
-            all_labels = []
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             
+            # Accumulate metrics
+            running_loss += loss.item()
+            epoch_loss += loss.item()
             with torch.no_grad():
-                for batch_idx, (inputs, labels) in enumerate(val_loader):
-                    try:
-                        inputs, labels = inputs.to(device), labels.to(device)
-                        outputs = model(inputs)
-                        loss = criterion(outputs, labels)
-                        val_loss += loss.item()
-                        
-                        _, predicted = outputs.max(1)
-                        all_preds.extend(predicted.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-                        val_batch_count += 1
-                        
-                    except Exception as e:
-                        logger.error(f"Error in validation batch {batch_idx}: {str(e)}")
-                        continue
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
             
-            if val_batch_count == 0:
-                logger.error("No successful validation batches in this epoch")
-                continue
+            # Store predictions for epoch metrics
+            all_train_preds.extend(predicted.cpu().numpy())
+            all_train_labels.extend(labels.cpu().numpy())
             
-            # Calculate metrics
-            val_loss = val_loss / val_batch_count
-            all_preds = np.array(all_preds)
-            all_labels = np.array(all_labels)
-            
-            accuracy = (all_preds == all_labels).mean()
-            precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='weighted')
-            conf_matrix = confusion_matrix(all_labels, all_preds)
-            
-            # Update history
-            history['val_loss'].append(val_loss)
-            history['val_acc'].append(accuracy)
-            history['val_precision'].append(precision)
-            history['val_recall'].append(recall)
-            history['val_f1'].append(f1)
-            
-            # Logging
-            logger.info(f'Epoch {epoch+1}/{num_epochs}:')
-            logger.info(f'Train Loss: {train_loss:.4f}')
-            logger.info(f'Val Loss: {val_loss:.4f}')
-            logger.info(f'Val Accuracy: {accuracy*100:.2f}%')
-            logger.info(f'Val Precision: {precision:.4f}')
-            logger.info(f'Val Recall: {recall:.4f}')
-            logger.info(f'Val F1: {f1:.4f}')
-            logger.info(f'Confusion Matrix:\n{conf_matrix}')
-            
-            # Learning rate scheduling
-            scheduler.step(val_loss)
-            
-            # Save best model (both by loss and accuracy)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_loss,
-                    'val_metrics': {
-                        'accuracy': accuracy,
-                        'precision': precision,
-                        'recall': recall,
-                        'f1': f1
-                    }
-                }, 'best_model_by_loss.pth')
-                logger.info(f'Saved new best model (by loss) with validation loss: {val_loss:.4f}')
-            
-            if accuracy > best_val_acc:
-                best_val_acc = accuracy
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_accuracy': accuracy,
-                    'val_metrics': {
-                        'loss': val_loss,
-                        'precision': precision,
-                        'recall': recall,
-                        'f1': f1
-                    }
-                }, 'best_model_by_accuracy.pth')
-                logger.info(f'Saved new best model (by accuracy) with validation accuracy: {accuracy*100:.2f}%')
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            # Early stopping
-            if patience_counter >= patience:
-                logger.info(f'Early stopping triggered after {epoch+1} epochs')
-                break
+            # Print batch progress with running metrics
+            if batch_idx % 10 == 9:
+                avg_loss = running_loss / 10
+                accuracy = 100. * correct / total
+                logger.info(
+                    f'Epoch: {epoch + 1} | '
+                    f'Batch: {batch_idx + 1}/{len(train_loader)} | '
+                    f'Loss: {avg_loss:.3f} | '
+                    f'Running Acc: {accuracy:.2f}% | '
+                    f'LR: {scheduler.get_last_lr()[0]:.6f}'
+                )
+                running_loss = 0.0
         
-        return model, history
+        # Calculate epoch training metrics
+        train_acc = 100. * correct / total
+        epoch_loss = epoch_loss / len(train_loader)
+        train_precision, train_recall, train_f1, _ = precision_recall_fscore_support(
+            all_train_labels, all_train_preds, average='weighted'
+        )
         
-    except Exception as e:
-        logger.error(f"Error during training: {str(e)}")
-        raise
+        # Log training metrics to tensorboard
+        writer.add_scalar('Loss/train', epoch_loss, epoch)
+        writer.add_scalar('Accuracy/train', train_acc, epoch)
+        writer.add_scalar('F1/train', train_f1, epoch)
+        
+        # Validation Phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_val_preds = []
+        all_val_labels = []
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+                
+                all_val_preds.extend(predicted.cpu().numpy())
+                all_val_labels.extend(labels.cpu().numpy())
+        
+        # Calculate validation metrics
+        val_acc = 100. * val_correct / val_total
+        val_loss = val_loss / len(val_loader)
+        val_precision, val_recall, val_f1, _ = precision_recall_fscore_support(
+            all_val_labels, all_val_preds, average='weighted'
+        )
+        
+        # Log validation metrics to tensorboard
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Accuracy/val', val_acc, epoch)
+        writer.add_scalar('F1/val', val_f1, epoch)
+        
+        # Print epoch summary
+        logger.info(
+            f'\nEpoch {epoch + 1} Summary:\n'
+            f'Training:\n'
+            f'  Loss: {epoch_loss:.3f}\n'
+            f'  Accuracy: {train_acc:.2f}%\n'
+            f'  Precision: {train_precision:.3f}\n'
+            f'  Recall: {train_recall:.3f}\n'
+            f'  F1: {train_f1:.3f}\n'
+            f'Validation:\n'
+            f'  Loss: {val_loss:.3f}\n'
+            f'  Accuracy: {val_acc:.2f}%\n'
+            f'  Precision: {val_precision:.3f}\n'
+            f'  Recall: {val_recall:.3f}\n'
+            f'  F1: {val_f1:.3f}'
+        )
+        
+        # Save best model based on validation accuracy
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_model = model.state_dict()
+            best_metrics = {
+                'epoch': epoch + 1,
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+                'val_f1': val_f1,
+                'val_precision': val_precision,
+                'val_recall': val_recall
+            }
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': best_model,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+                'val_f1': val_f1,
+                'metrics': best_metrics
+            }, 'best_model.pth')
+            logger.info(f'\nSaved new best model with validation accuracy: {val_acc:.2f}%')
+        
+        # Clear GPU cache after each epoch
+        torch.cuda.empty_cache()
+    
+    writer.close()
+    
+    # Print best model summary
+    if best_metrics:
+        logger.info(
+            f'\nBest Model Performance (Epoch {best_metrics["epoch"]}):\n'
+            f'Validation Accuracy: {best_metrics["val_acc"]:.2f}%\n'
+            f'Validation Loss: {best_metrics["val_loss"]:.3f}\n'
+            f'Validation F1: {best_metrics["val_f1"]:.3f}\n'
+            f'Validation Precision: {best_metrics["val_precision"]:.3f}\n'
+            f'Validation Recall: {best_metrics["val_recall"]:.3f}'
+        )
+    
+    return model, best_model
 
 def download_and_extract_dataset(dataset_name):
     """
@@ -608,46 +596,59 @@ def train_models():
     Main function to train models with k-fold cross-validation.
     """
     try:
-        # Check and download datasets if needed
-        check_and_download_datasets()
+        # Initialize GPU
+        device = setup_device()
+        diagnose_gpu()  # Print GPU info
+        logger.info(f"Using device: {device}")
         
         # Train skin cancer detection model
         logger.info("Training skin cancer detection model...")
-        skin_data_dir = Path("datasets/skin_cancer")
+        skin_data_dir = Path("backend/datasets/skin_cancer")
         
+        if not skin_data_dir.exists():
+            logger.error(f"Skin cancer dataset directory not found at {skin_data_dir}")
+            return
+            
         if not (skin_data_dir / "train").exists() or not any((skin_data_dir / "train").iterdir()):
             logger.error("Skin cancer dataset not found or empty. Skipping training.")
             return
             
         # Use k-fold cross-validation
         k_folds = 5
-        device = setup_device()
         
         for fold in range(k_folds):
             logger.info(f"Training fold {fold + 1}/{k_folds}")
             
-            # Create model
-            model = EfficientModel(num_classes=7).to(device)
-            
             try:
                 # Create data loaders for this fold
-                train_loader, val_loader = create_data_loaders(skin_data_dir, fold_idx=fold, k_folds=k_folds)
+                train_loader, val_loader = create_data_loaders(
+                    skin_data_dir, 
+                    batch_size=64,  # Start with smaller batch size
+                    num_workers=2,   # Reduce workers
+                    fold_idx=fold, 
+                    k_folds=k_folds
+                )
+                
+                # Create model
+                model = EfficientModel(num_classes=7)
+                model = model.to(device)  # Move to GPU first
                 
                 # Train the model
-                model, history = train_model(
+                model, best_model_state = train_model(
                     model=model,
                     train_loader=train_loader,
                     val_loader=val_loader,
                     device=device,
-                    num_epochs=50  # Adjust as needed
+                    num_epochs=50
                 )
                 
                 # Save fold-specific model
+                save_path = f'skin_cancer_model_fold_{fold}.pth'
                 torch.save({
                     'fold': fold,
-                    'model_state_dict': model.state_dict(),
-                    'history': history
-                }, f'skin_cancer_model_fold_{fold}.pth')
+                    'model_state_dict': best_model_state,
+                }, save_path)
+                logger.info(f"Saved model to {save_path}")
                 
             except Exception as e:
                 logger.error(f"Error training fold {fold + 1}: {str(e)}")
@@ -655,33 +656,43 @@ def train_models():
         
         # Train malaria detection model
         logger.info("Training malaria detection model...")
-        malaria_data_dir = Path("datasets/malaria")
+        malaria_data_dir = Path("backend/datasets/malaria")
         
+        if not malaria_data_dir.exists():
+            logger.error(f"Malaria dataset directory not found at {malaria_data_dir}")
+            return
+            
         if not (malaria_data_dir / "train").exists() or not any((malaria_data_dir / "train").iterdir()):
             logger.error("Malaria dataset not found or empty. Skipping training.")
             return
             
-        # Create malaria model
-        model = EfficientModel(num_classes=2).to(device)
-        
         try:
             # Create data loaders
-            train_loader, val_loader = create_data_loaders(malaria_data_dir)
+            train_loader, val_loader = create_data_loaders(
+                malaria_data_dir,
+                batch_size=64,  # Start with smaller batch size
+                num_workers=2    # Reduce workers
+            )
+            
+            # Create malaria model
+            model = EfficientModel(num_classes=2)
+            model = model.to(device)  # Move to GPU first
             
             # Train the model
-            model, history = train_model(
+            model, best_model_state = train_model(
                 model=model,
                 train_loader=train_loader,
                 val_loader=val_loader,
                 device=device,
-                num_epochs=50  # Adjust as needed
+                num_epochs=50
             )
             
             # Save final model
+            save_path = 'malaria_model.pth'
             torch.save({
-                'model_state_dict': model.state_dict(),
-                'history': history
-            }, 'malaria_model.pth')
+                'model_state_dict': best_model_state,
+            }, save_path)
+            logger.info(f"Saved model to {save_path}")
             
         except Exception as e:
             logger.error(f"Error training malaria model: {str(e)}")
@@ -691,4 +702,10 @@ def train_models():
         raise
 
 if __name__ == "__main__":
+    # Set up logging to file
+    file_handler = logging.FileHandler('training.log')
+    file_handler.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    
+    # Start training
     train_models()

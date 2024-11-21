@@ -68,17 +68,18 @@ const MLPrediction = ({ title, endpoint }) => {
     formData.append('file', selectedFile);
 
     try {
+      console.log('Making request to:', `${import.meta.env.VITE_API_URL}${endpoint}`);
       const response = await fetch(`${import.meta.env.VITE_API_URL}${endpoint}`, {
         method: 'POST',
         body: formData,
       });
       
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to get prediction');
+        throw new Error('Failed to get prediction');
       }
       
       const result = await response.json();
+      console.log('Prediction result:', result);
       setPrediction(result);
       setRetryCount(0);
     } catch (error) {
@@ -98,33 +99,35 @@ const MLPrediction = ({ title, endpoint }) => {
     if (!prediction) return null;
 
     const confidence = (prediction.confidence * 100).toFixed(1);
-    const result = prediction.prediction > 0.5 ? 
-      (title.includes('Skin Cancer') ? 'Malignant' : 'Parasitized') :
-      (title.includes('Skin Cancer') ? 'Benign' : 'Uninfected');
+    const result = prediction.prediction > 0.5 ? 'Positive' : 'Negative';
+    const timestamp = new Date(prediction.timestamp).toLocaleString();
 
     return (
-      <Box sx={{ mt: 2, textAlign: 'center' }}>
-        <Typography variant="h6" color={result === 'Malignant' || result === 'Parasitized' ? 'error' : 'success'}>
+      <Box sx={{ mt: 2 }}>
+        <Typography variant="h6" gutterBottom>
+          Prediction Result:
+        </Typography>
+        <Typography>
           Result: {result}
         </Typography>
-        <Typography variant="body1">
+        <Typography>
           Confidence: {confidence}%
         </Typography>
-        <Typography variant="caption" color="text.secondary">
-          Prediction made at: {new Date(prediction.timestamp).toLocaleString()}
+        <Typography variant="caption" display="block">
+          Timestamp: {timestamp}
         </Typography>
       </Box>
     );
   };
 
   return (
-    <Card sx={{ maxWidth: 600, mx: 'auto', my: 2 }}>
+    <Card sx={{ mb: 4 }}>
       <CardContent>
         <Typography variant="h5" gutterBottom>
           {title}
         </Typography>
-        
-        <Box sx={{ my: 2 }}>
+
+        <Box sx={{ mt: 2 }}>
           <label htmlFor={`upload-${title}`}>
             <Input
               accept="image/*"
@@ -133,59 +136,40 @@ const MLPrediction = ({ title, endpoint }) => {
               onChange={handleFileSelect}
               disabled={loading}
             />
-            <Button 
-              variant="contained" 
-              component="span"
-              disabled={loading}
-              color={error ? 'error' : 'primary'}
-            >
-              Upload Image
-            </Button>
-          </label>
-        </Box>
-
-        {error && (
-          <Typography color="error" variant="body2" sx={{ mt: 1 }}>
-            {error}
-            {retryCount < maxRetries && (
-              <Button
-                size="small"
-                onClick={handleRetry}
-                sx={{ ml: 1 }}
-              >
-                Retry
-              </Button>
-            )}
-          </Typography>
-        )}
-
-        {preview && (
-          <Box sx={{ textAlign: 'center' }}>
-            <ImagePreview src={preview} alt="Preview" />
-          </Box>
-        )}
-
-        {selectedFile && (
-          <Box sx={{ mt: 2, textAlign: 'center' }}>
             <Button
               variant="contained"
-              color="primary"
-              onClick={handleSubmit}
+              component="span"
               disabled={loading}
             >
-              {loading ? (
-                <>
-                  <CircularProgress size={24} sx={{ mr: 1 }} />
-                  Processing...
-                </>
-              ) : (
-                'Get Prediction'
-              )}
+              Select Image
             </Button>
-          </Box>
-        )}
+          </label>
 
-        {renderPredictionResult()}
+          {preview && (
+            <Box sx={{ mt: 2 }}>
+              <ImagePreview src={preview} alt="Preview" />
+            </Box>
+          )}
+
+          {selectedFile && (
+            <Button
+              variant="contained"
+              onClick={handleSubmit}
+              disabled={loading}
+              sx={{ mt: 2, ml: 2 }}
+            >
+              {loading ? <CircularProgress size={24} /> : 'Analyze'}
+            </Button>
+          )}
+
+          {error && (
+            <Typography color="error" sx={{ mt: 2 }}>
+              Error: {error}
+            </Typography>
+          )}
+
+          {renderPredictionResult()}
+        </Box>
       </CardContent>
     </Card>
   );
